@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Runtime data (sensitive — may contain real merchant names / PII)
+uploads/
+reports/
+
+# Cached sanction list files (public data, but ~130MB; re-downloads on sync)
+data/lists/
+
+# Database (including SQLite WAL journal files)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.sqlite
+data/*.sqlite3
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Local agent / tool config (not shared)
+.claude/
