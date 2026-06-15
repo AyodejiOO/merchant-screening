@@ -1,5 +1,12 @@
 # Merchant Sanction Screening
 
+> Screen any merchant against six global sanctions lists and adverse media in one request — fuzzy matching, single-name lookup, and bulk CSV batch jobs with a full audit trail.
+
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Node](https://img.shields.io/badge/Node-22%20LTS-339933?logo=node.js&logoColor=white)
+![Express](https://img.shields.io/badge/Express-4-000000?logo=express&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-better--sqlite3-003B57?logo=sqlite&logoColor=white)
+
 A compliance screening tool for fintech and payments teams. Screens merchants against six global sanction lists and adverse media sources, with fuzzy matching, single name lookup, and bulk CSV batch processing.
 
 ## What it does

@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Internal merchant sanction screening tool — OFAC, EU, UN, UK, Australia, Canada",
   "main": "src/server.js",
+  "license": "MIT",
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js"
