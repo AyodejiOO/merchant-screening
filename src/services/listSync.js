@@ -1,7 +1,7 @@
 const axios  = require('axios');
 const fs     = require('fs');
 const path   = require('path');
-const { getDb }         = require('../db/database');
+const { get, run, withTransaction } = require('../db/database');
 const { parseOFAC }     = require('../parsers/ofac');
 const { parseEU }       = require('../parsers/eu');
 const { parseUN }       = require('../parsers/un');
@@ -72,8 +72,38 @@ async function downloadRaw(config) {
   return isBinary ? Buffer.from(resp.data) : resp.data;
 }
 
+// Atomic replace of one list's entries: DELETE then re-INSERT in batches, all in
+// one transaction so a list is never left empty if something fails midway.
+// Batched multi-row INSERT (~1000 rows/statement) keeps round-trips low over the
+// network — a row-at-a-time loop would be unbearably slow against a remote DB.
+async function replaceEntries(listSource, entries) {
+  const COLS = 8;
+  const BATCH = 1000;
+  await withTransaction(async (client) => {
+    await client.query(`DELETE FROM sanctions_entries WHERE list_source = $1`, [listSource]);
+    for (let i = 0; i < entries.length; i += BATCH) {
+      const slice = entries.slice(i, i + BATCH);
+      const values = [];
+      const tuples = slice.map((e, r) => {
+        const b = r * COLS;
+        values.push(
+          e.list_source, e.entity_type ?? 'unknown', e.name,
+          e.aliases ?? '[]', e.country ?? null, e.program ?? null,
+          e.additional_info ?? '{}', e.raw_id ?? null,
+        );
+        return `($${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7},$${b+8})`;
+      });
+      await client.query(
+        `INSERT INTO sanctions_entries
+          (list_source, entity_type, name, aliases, country, program, additional_info, raw_id)
+         VALUES ${tuples.join(',')}`,
+        values
+      );
+    }
+  });
+}
+
 async function syncList(listSource) {
-  const db     = getDb();
   const config = LIST_CONFIGS[listSource];
   if (!config) throw new Error(`Unknown list source: ${listSource}`);
 
@@ -82,7 +112,7 @@ async function syncList(listSource) {
     const cachedPath = path.join(LISTS_DIR, config.filename);
     if (!fs.existsSync(cachedPath)) {
       const msg = `No auto-download URL configured. Please use Manual Import in Settings. Download from: ${config.manualDownloadPage || 'official source'}`;
-      db.prepare(`INSERT INTO sync_log (list_source, status, error_message) VALUES (?, 'manual_required', ?)`).run(listSource, msg);
+      await run(`INSERT INTO sync_log (list_source, status, error_message) VALUES ($1, 'manual_required', $2)`, [listSource, msg]);
       throw new Error(msg);
     }
     // Use cached/manually-imported file
@@ -110,7 +140,7 @@ async function syncList(listSource) {
         console.log(`[Sync] ${listSource} — using cached file`);
       } else {
         const msg = `Download failed and no cache: ${err.message}`;
-        db.prepare(`INSERT INTO sync_log (list_source, status, error_message) VALUES (?, 'failed', ?)`).run(listSource, msg);
+        await run(`INSERT INTO sync_log (list_source, status, error_message) VALUES ($1, 'failed', $2)`, [listSource, msg]);
         throw new Error(msg);
       }
     }
@@ -127,23 +157,14 @@ async function syncList(listSource) {
     console.log(`[Sync] ${listSource} — parsed ${entries.length} entries`);
   } catch (err) {
     const msg = `Parse failed: ${err.message}`;
-    db.prepare(`INSERT INTO sync_log (list_source, status, error_message) VALUES (?, 'failed', ?)`).run(listSource, msg);
+    await run(`INSERT INTO sync_log (list_source, status, error_message) VALUES ($1, 'failed', $2)`, [listSource, msg]);
     throw new Error(msg);
   }
 
   // Atomic replace
-  db.transaction(() => {
-    db.prepare(`DELETE FROM sanctions_entries WHERE list_source = ?`).run(listSource);
-    const ins = db.prepare(`
-      INSERT INTO sanctions_entries
-        (list_source, entity_type, name, aliases, country, program, additional_info, raw_id)
-      VALUES
-        (@list_source, @entity_type, @name, @aliases, @country, @program, @additional_info, @raw_id)
-    `);
-    for (const e of entries) ins.run(e);
-  })();
+  await replaceEntries(listSource, entries);
 
-  db.prepare(`INSERT INTO sync_log (list_source, status, records_count) VALUES (?, 'success', ?)`).run(listSource, entries.length);
+  await run(`INSERT INTO sync_log (list_source, status, records_count) VALUES ($1, 'success', $2)`, [listSource, entries.length]);
   console.log(`[Sync] ${listSource} — complete (${entries.length} entries)`);
   return entries.length;
 }
@@ -160,26 +181,24 @@ async function syncAllLists() {
   return results;
 }
 
-function getListStatus() {
-  const db = getDb();
-  return Object.fromEntries(
-    Object.entries(LIST_CONFIGS).map(([src, cfg]) => {
-      const lastSync = db.prepare(`SELECT * FROM sync_log WHERE list_source = ? ORDER BY synced_at DESC LIMIT 1`).get(src);
-      const count    = db.prepare(`SELECT COUNT(*) as n FROM sanctions_entries WHERE list_source = ?`).get(src);
-      return [src, {
-        label:       cfg.label,
-        lastSync:    lastSync?.synced_at  || null,
-        lastStatus:  lastSync?.status     || 'never',
-        recordCount: count?.n             || 0,
-        error:       lastSync?.error_message || null,
-      }];
-    })
-  );
+async function getListStatus() {
+  const out = {};
+  for (const [src, cfg] of Object.entries(LIST_CONFIGS)) {
+    const lastSync = await get(`SELECT * FROM sync_log WHERE list_source = $1 ORDER BY synced_at DESC LIMIT 1`, [src]);
+    const count    = await get(`SELECT COUNT(*)::int as n FROM sanctions_entries WHERE list_source = $1`, [src]);
+    out[src] = {
+      label:       cfg.label,
+      lastSync:    lastSync?.synced_at  || null,
+      lastStatus:  lastSync?.status     || 'never',
+      recordCount: count?.n             || 0,
+      error:       lastSync?.error_message || null,
+    };
+  }
+  return out;
 }
 
 // Check if remote list is newer than our last sync (uses HTTP HEAD — no full download)
 async function checkForUpdates() {
-  const db      = getDb();
   const results = {};
 
   for (const [src, cfg] of Object.entries(LIST_CONFIGS)) {
@@ -196,9 +215,10 @@ async function checkForUpdates() {
         ? new Date(resp.headers['last-modified'])
         : null;
 
-      const lastSync = db.prepare(
-        `SELECT synced_at FROM sync_log WHERE list_source = ? AND status = 'success' ORDER BY synced_at DESC LIMIT 1`
-      ).get(src);
+      const lastSync = await get(
+        `SELECT synced_at FROM sync_log WHERE list_source = $1 AND status = 'success' ORDER BY synced_at DESC LIMIT 1`,
+        [src]
+      );
       const lastSyncDate = lastSync ? new Date(lastSync.synced_at) : null;
 
       const updateAvailable = remoteModified && lastSyncDate
@@ -229,7 +249,6 @@ function updateListUrl(listSource, newUrl) {
 
 // Manual import: user uploads a file they downloaded from the official source
 async function importListFile(listSource, filePath) {
-  const db     = getDb();
   const config = LIST_CONFIGS[listSource];
   if (!config) throw new Error(`Unknown list source: ${listSource}`);
 
@@ -244,7 +263,7 @@ async function importListFile(listSource, filePath) {
       : config.parser(rawData);
   } catch (err) {
     const msg = `Parse failed: ${err.message}`;
-    db.prepare(`INSERT INTO sync_log (list_source, status, error_message) VALUES (?, 'failed', ?)`).run(listSource, msg);
+    await run(`INSERT INTO sync_log (list_source, status, error_message) VALUES ($1, 'failed', $2)`, [listSource, msg]);
     throw new Error(msg);
   }
 
@@ -254,17 +273,9 @@ async function importListFile(listSource, filePath) {
   const cachedPath = path.join(LISTS_DIR, config.filename);
   fs.copyFileSync(filePath, cachedPath);
 
-  db.transaction(() => {
-    db.prepare(`DELETE FROM sanctions_entries WHERE list_source = ?`).run(listSource);
-    const ins = db.prepare(`
-      INSERT INTO sanctions_entries
-        (list_source, entity_type, name, aliases, country, program, additional_info, raw_id)
-      VALUES (@list_source, @entity_type, @name, @aliases, @country, @program, @additional_info, @raw_id)
-    `);
-    for (const e of entries) ins.run(e);
-  })();
+  await replaceEntries(listSource, entries);
 
-  db.prepare(`INSERT INTO sync_log (list_source, status, records_count) VALUES (?, 'success', ?)`).run(listSource, entries.length);
+  await run(`INSERT INTO sync_log (list_source, status, records_count) VALUES ($1, 'success', $2)`, [listSource, entries.length]);
   console.log(`[Import] ${listSource} — imported ${entries.length} entries from ${filePath}`);
   return entries.length;
 }

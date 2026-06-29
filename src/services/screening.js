@@ -1,5 +1,5 @@
 const Fuse   = require('fuse.js');
-const { getDb } = require('../db/database');
+const { all, run, withTransaction, getSetting } = require('../db/database');
 
 let fuseIndex  = null;
 let indexItems = [];
@@ -13,13 +13,8 @@ function normalizeName(name) {
     .trim();
 }
 
-function getSetting(db, key, fallback) {
-  return db.prepare(`SELECT value FROM settings WHERE key = ?`).get(key)?.value ?? fallback;
-}
-
-function buildIndex() {
-  const db      = getDb();
-  const entries = db.prepare(`SELECT * FROM sanctions_entries`).all();
+async function buildIndex() {
+  const entries = await all(`SELECT * FROM sanctions_entries`);
 
   indexItems = [];
 
@@ -60,14 +55,20 @@ function buildIndex() {
   return indexItems.length;
 }
 
+// Synchronous: reads settings from the in-memory cache (loaded at startup) and
+// searches the in-memory Fuse index. No DB/await on the hot path, so large
+// batches don't fan out network calls. buildIndex() must have run first.
 function screenName(inputName, options = {}) {
-  if (!fuseIndex) buildIndex();
+  if (!fuseIndex) {
+    // Index not built yet (should not happen post-startup). Fail safe to "clear".
+    console.warn('[screen] index not built — returning clear');
+    return { inputName, status: 'clear', topMatchScore: 0, topMatchName: null, topMatchSource: null, matches: [] };
+  }
 
-  const db            = getDb();
-  const threshold     = options.threshold     ?? parseFloat(getSetting(db, 'fuzzy_threshold', '0.6'));
-  const maxMatches    = options.maxMatches    ?? parseInt(getSetting(db, 'max_matches', '10'));
-  const highThresh    = parseFloat(getSetting(db, 'match_status_high',   '0.85'));
-  const mediumThresh  = parseFloat(getSetting(db, 'match_status_medium', '0.70'));
+  const threshold     = options.threshold     ?? parseFloat(getSetting('fuzzy_threshold', '0.6'));
+  const maxMatches    = options.maxMatches    ?? parseInt(getSetting('max_matches', '10'));
+  const highThresh    = parseFloat(getSetting('match_status_high',   '0.85'));
+  const mediumThresh  = parseFloat(getSetting('match_status_medium', '0.70'));
 
   const normalized  = normalizeName(inputName);
   const rawResults  = fuseIndex.search(normalized, { limit: maxMatches * 8 });
@@ -126,17 +127,15 @@ function screenName(inputName, options = {}) {
 }
 
 async function runBatchJob(jobId, names, threshold) {
-  const db = getDb();
-  if (!fuseIndex) buildIndex();
+  if (!fuseIndex) await buildIndex();
 
-  db.prepare(`UPDATE screening_jobs SET status = 'running', total_records = ? WHERE id = ?`).run(names.length, jobId);
+  await run(`UPDATE screening_jobs SET status = 'running', total_records = $1 WHERE id = $2`, [names.length, jobId]);
 
-  const insertResult = db.prepare(`
+  const INSERT = `
     INSERT INTO screening_results
       (job_id, input_name, row_number, status, top_match_score, top_match_name, top_match_source, matches)
-    VALUES
-      (@job_id, @input_name, @row_number, @status, @top_match_score, @top_match_name, @top_match_source, @matches)
-  `);
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+  `;
 
   let processed  = 0;
   let matchCount = 0;
@@ -145,33 +144,27 @@ async function runBatchJob(jobId, names, threshold) {
   for (let i = 0; i < names.length; i += CHUNK) {
     const chunk = names.slice(i, i + CHUNK);
 
-    db.transaction(() => {
+    await withTransaction(async (client) => {
       for (const { name, rowNumber } of chunk) {
         const r = screenName(name, { threshold });
-        insertResult.run({
-          job_id:           jobId,
-          input_name:       name,
-          row_number:       rowNumber,
-          status:           r.status,
-          top_match_score:  r.topMatchScore,
-          top_match_name:   r.topMatchName,
-          top_match_source: r.topMatchSource,
-          matches:          JSON.stringify(r.matches),
-        });
+        await client.query(INSERT, [
+          jobId, name, rowNumber, r.status,
+          r.topMatchScore, r.topMatchName, r.topMatchSource, JSON.stringify(r.matches),
+        ]);
         if (r.status !== 'clear') matchCount++;
         processed++;
       }
-    })();
+    });
 
-    db.prepare(`UPDATE screening_jobs SET processed_records = ?, match_count = ? WHERE id = ?`)
-      .run(processed, matchCount, jobId);
+    await run(`UPDATE screening_jobs SET processed_records = $1, match_count = $2 WHERE id = $3`,
+      [processed, matchCount, jobId]);
   }
 
-  db.prepare(`
+  await run(`
     UPDATE screening_jobs
-    SET status = 'completed', completed_at = CURRENT_TIMESTAMP, processed_records = ?, match_count = ?
-    WHERE id = ?
-  `).run(processed, matchCount, jobId);
+    SET status = 'completed', completed_at = now(), processed_records = $1, match_count = $2
+    WHERE id = $3
+  `, [processed, matchCount, jobId]);
 
   return { processed, matchCount };
 }
@@ -180,18 +173,15 @@ async function runBatchJob(jobId, names, threshold) {
 // Called after runBatchJob (sanctions) if checks includes 'media'.
 // Processes in small async chunks to avoid hammering the News API.
 async function runBatchMediaJob(jobId, names, opts = {}) {
-  const db          = getDb();
   const { searchAdverseMedia } = require('./media');
   const lookbackDays = opts.lookbackDays || 365;
 
-  const insertMedia = db.prepare(`
+  const INSERT = `
     INSERT INTO adverse_media_results
       (job_id, input_name, row_number, status, finding_count,
        top_finding_score, top_finding_category, top_finding_source, findings)
-    VALUES
-      (@job_id, @input_name, @row_number, @status, @finding_count,
-       @top_finding_score, @top_finding_category, @top_finding_source, @findings)
-  `);
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+  `;
 
   // Process in parallel chunks. Larger chunks = faster but more concurrent RSS requests.
   // 5 at a time is a safe rate for the free Google News RSS endpoint.
@@ -206,25 +196,19 @@ async function runBatchMediaJob(jobId, names, opts = {}) {
       )
     );
 
-    db.transaction(() => {
+    await withTransaction(async (client) => {
       for (const settled of results) {
         if (settled.status === 'rejected') continue;
         const { name, rowNumber, result: r } = settled.value;
         const top = r.findings?.[0];
         if (r.status !== 'clear') mediaMatchCount++;
-        insertMedia.run({
-          job_id:               jobId,
-          input_name:           name,
-          row_number:           rowNumber,
-          status:               r.status,
-          finding_count:        r.findings?.length || 0,
-          top_finding_score:    r.topFindingScore  || 0,
-          top_finding_category: r.topFindingCategory || null,
-          top_finding_source:   top?.source || null,
-          findings:             JSON.stringify(r.findings || []),
-        });
+        await client.query(INSERT, [
+          jobId, name, rowNumber, r.status, r.findings?.length || 0,
+          r.topFindingScore || 0, r.topFindingCategory || null, top?.source || null,
+          JSON.stringify(r.findings || []),
+        ]);
       }
-    })();
+    });
   }
 
   return { mediaMatchCount };

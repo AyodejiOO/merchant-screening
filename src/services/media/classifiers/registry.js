@@ -10,12 +10,7 @@
 
 const keyword = require('./keyword');
 const llm     = require('./llm');
-const { getDb } = require('../../../db/database');
-
-function getSetting(key, fallback) {
-  const row = getDb().prepare(`SELECT value FROM settings WHERE key = ?`).get(key);
-  return row?.value ?? fallback;
-}
+const { getSetting } = require('../../../db/database');
 
 function get() {
   const mode = getSetting('media_classifier_mode', 'keyword');

@@ -4,41 +4,43 @@
 // POST /api/media/sources/:src/sync — test-fetch for a source (logs result)
 
 const express  = require('express');
-const { getDb } = require('../db/database');
+const { get, run } = require('../db/database');
 const { listFetchers, getFetcher, fetchAll } = require('../services/media/fetchers/registry');
 
 const router = express.Router();
 
 // ── GET /api/media/sources ────────────────────────────────────────────────────
 // Merges the static fetcher registry with the last sync_log entry per source.
-router.get('/sources', (req, res) => {
-  const db       = getDb();
-  const fetchers = listFetchers();
+router.get('/sources', async (req, res) => {
+  try {
+    const fetchers = listFetchers();
 
-  const sources = fetchers.map(f => {
-    const last = db.prepare(`
-      SELECT * FROM adverse_media_sync_log
-      WHERE source = ? ORDER BY synced_at DESC LIMIT 1
-    `).get(f.name);
+    const sources = await Promise.all(fetchers.map(async f => {
+      const last = await get(`
+        SELECT * FROM adverse_media_sync_log
+        WHERE source = $1 ORDER BY synced_at DESC LIMIT 1
+      `, [f.name]);
 
-    return {
-      name:          f.name,
-      label:         f.label,
-      lastUsed:      last?.synced_at       || null,
-      lastStatus:    last?.status          || 'never',
-      lastCount:     last?.records_count   || 0,
-      error:         last?.error_message   || null,
-    };
-  });
+      return {
+        name:          f.name,
+        label:         f.label,
+        lastUsed:      last?.synced_at       || null,
+        lastStatus:    last?.status          || 'never',
+        lastCount:     last?.records_count   || 0,
+        error:         last?.error_message   || null,
+      };
+    }));
 
-  res.json(sources);
+    res.json(sources);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── POST /api/media/sources/:src/sync ─────────────────────────────────────────
 // Runs a lightweight test fetch ("test" as the name) and logs the result.
 // Used by the dashboard's per-source "Test" button.
 router.post('/sources/:src/sync', express.json(), async (req, res) => {
-  const db  = getDb();
   const src = req.params.src;
   const fetchers = listFetchers();
   if (!fetchers.find(f => f.name === src)) {
@@ -52,17 +54,17 @@ router.post('/sources/:src/sync', express.json(), async (req, res) => {
     // rate-limit doesn't pollute another source's test result.
     const articles = await fetcher.fetch(testName, { lookbackDays: 30, max: 10 });
 
-    db.prepare(`
+    await run(`
       INSERT INTO adverse_media_sync_log (source, status, records_count, error_message)
-      VALUES (?, 'success', ?, NULL)
-    `).run(src, articles.length);
+      VALUES ($1, 'success', $2, NULL)
+    `, [src, articles.length]);
 
     res.json({ source: src, status: 'success', count: articles.length, error: null });
   } catch (err) {
-    db.prepare(`
+    await run(`
       INSERT INTO adverse_media_sync_log (source, status, records_count, error_message)
-      VALUES (?, 'error', 0, ?)
-    `).run(src, err.message);
+      VALUES ($1, 'error', 0, $2)
+    `, [src, err.message]);
     res.status(500).json({ error: err.message });
   }
 });

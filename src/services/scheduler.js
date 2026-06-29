@@ -1,28 +1,24 @@
 const cron    = require('node-cron');
 const fs      = require('fs');
-const { getDb }         = require('../db/database');
+const { get, run, getSetting } = require('../db/database');
 const { syncAllLists }  = require('./listSync');
 const { buildIndex, runBatchJob } = require('./screening');
 
 let syncTask  = null;
 let batchTask = null;
 
-function getSetting(db, key, fallback) {
-  return db.prepare(`SELECT value FROM settings WHERE key = ?`).get(key)?.value ?? fallback;
-}
-
 function initScheduler() {
-  const db              = getDb();
-  const syncSchedule    = getSetting(db, 'sync_schedule',      '0 2 * * 0');
-  const batchSchedule   = getSetting(db, 'batch_schedule',     '0 3 1 * *');
-  const autoBatchEnabled = getSetting(db, 'auto_batch_enabled', 'false') === 'true';
+  // Settings come from the in-memory cache (loaded at startup).
+  const syncSchedule     = getSetting('sync_schedule',      '0 2 * * 0');
+  const batchSchedule    = getSetting('batch_schedule',     '0 3 1 * *');
+  const autoBatchEnabled = getSetting('auto_batch_enabled', 'false') === 'true';
 
   if (cron.validate(syncSchedule)) {
     syncTask = cron.schedule(syncSchedule, async () => {
       console.log('[Scheduler] Running scheduled list sync…');
       try {
         const results = await syncAllLists();
-        buildIndex();
+        await buildIndex();
         console.log('[Scheduler] Sync complete:', JSON.stringify(results));
       } catch (err) {
         console.error('[Scheduler] Sync error:', err.message);
@@ -45,13 +41,11 @@ function initScheduler() {
 }
 
 async function runScheduledBatch() {
-  const db = getDb();
-
-  const lastJob = db.prepare(`
+  const lastJob = await get(`
     SELECT * FROM screening_jobs
     WHERE status = 'completed' AND file_path IS NOT NULL
     ORDER BY created_at DESC LIMIT 1
-  `).get();
+  `);
 
   if (!lastJob) {
     console.log('[Scheduler] No previous batch job to re-run');
@@ -79,10 +73,12 @@ async function runScheduledBatch() {
     .filter(n => n.name);
 
   const jobName = `Auto Re-screen — ${new Date().toISOString().slice(0, 10)}`;
-  const { lastInsertRowid: jobId } = db.prepare(`
+  const { rows } = await run(`
     INSERT INTO screening_jobs (job_name, job_type, status, threshold, file_path)
-    VALUES (?, 'scheduled', 'pending', ?, ?)
-  `).run(jobName, lastJob.threshold, lastJob.file_path);
+    VALUES ($1, 'scheduled', 'pending', $2, $3)
+    RETURNING id
+  `, [jobName, lastJob.threshold, lastJob.file_path]);
+  const jobId = rows[0].id;
 
   const result = await runBatchJob(jobId, names, lastJob.threshold);
   console.log(`[Scheduler] Auto batch complete: ${result.processed} records, ${result.matchCount} matches`);

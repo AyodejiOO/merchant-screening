@@ -8,7 +8,7 @@ const fs      = require('fs');
 const { parse } = require('csv-parse/sync');
 const { screenUnified, normaliseChecks } = require('../services/orchestrator');
 const { runBatchJob, runBatchMediaJob }  = require('../services/screening');
-const { getDb } = require('../db/database');
+const { get, all, run } = require('../db/database');
 
 const UPLOADS_DIR = path.join(__dirname, '../../uploads');
 
@@ -44,7 +44,7 @@ router.post('/single', express.json(), async (req, res) => {
 //   body: { uploadId, jobName?, threshold?, checks?, lookbackDays? }
 //   Accepts the same uploadId from /api/screening/upload. Runs whichever checks
 //   are requested. Media runs after sanctions to keep progress tracking simple.
-router.post('/batch', express.json(), (req, res) => {
+router.post('/batch', express.json(), async (req, res) => {
   const { uploadId, nameColumn = null } = req.body || {};
   if (!uploadId) return res.status(400).json({ error: 'uploadId is required (run /upload first).' });
 
@@ -53,17 +53,23 @@ router.post('/batch', express.json(), (req, res) => {
     return res.status(404).json({ error: 'Uploaded file not found. Re-upload and try again.' });
   }
 
-  const db          = getDb();
-  const threshold   = req.body.threshold != null ? parseFloat(req.body.threshold) / 100 : 0.6;
+  const threshold    = req.body.threshold != null ? parseFloat(req.body.threshold) / 100 : 0.6;
   const lookbackDays = req.body.lookbackDays != null ? parseInt(req.body.lookbackDays, 10) : 365;
-  const checks      = normaliseChecks(req.body.checks);
-  const checksStr   = checks.join(',');
-  const jobName     = req.body.jobName || `Batch — ${new Date().toLocaleString()}`;
+  const checks       = normaliseChecks(req.body.checks);
+  const checksStr    = checks.join(',');
+  const jobName      = req.body.jobName || `Batch — ${new Date().toLocaleString()}`;
 
-  const { lastInsertRowid: jobId } = db.prepare(`
-    INSERT INTO screening_jobs (job_name, job_type, status, threshold, file_path, checks_run, lookback_days)
-    VALUES (?, 'batch', 'pending', ?, ?, ?, ?)
-  `).run(jobName, threshold, filePath, checksStr, lookbackDays);
+  let jobId;
+  try {
+    const { rows } = await run(`
+      INSERT INTO screening_jobs (job_name, job_type, status, threshold, file_path, checks_run, lookback_days)
+      VALUES ($1, 'batch', 'pending', $2, $3, $4, $5)
+      RETURNING id
+    `, [jobName, threshold, filePath, checksStr, lookbackDays]);
+    jobId = rows[0].id;
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 
   res.json({ jobId, status: 'pending', checks, message: 'Batch screening started' });
 
@@ -75,7 +81,7 @@ router.post('/batch', express.json(), (req, res) => {
         columns: true, skip_empty_lines: true, trim: true, bom: true, relax_column_count: true,
       });
       if (!records.length) {
-        db.prepare(`UPDATE screening_jobs SET status = 'failed' WHERE id = ?`).run(jobId);
+        await run(`UPDATE screening_jobs SET status = 'failed' WHERE id = $1`, [jobId]);
         return;
       }
 
@@ -94,7 +100,7 @@ router.post('/batch', express.json(), (req, res) => {
         await runBatchJob(jobId, names, threshold);
       } else {
         // Even if sanctions is skipped, mark total_records + set status to running
-        db.prepare(`UPDATE screening_jobs SET status = 'running', total_records = ? WHERE id = ?`).run(names.length, jobId);
+        await run(`UPDATE screening_jobs SET status = 'running', total_records = $1 WHERE id = $2`, [names.length, jobId]);
       }
 
       // Phase B: adverse media (async, slower — one network call per name)
@@ -104,15 +110,15 @@ router.post('/batch', express.json(), (req, res) => {
 
       // Mark complete only if sanctions didn't already do it
       if (!checks.includes('sanctions')) {
-        db.prepare(`
+        await run(`
           UPDATE screening_jobs
-          SET status = 'completed', completed_at = CURRENT_TIMESTAMP, processed_records = ?
-          WHERE id = ?
-        `).run(names.length, jobId);
+          SET status = 'completed', completed_at = now(), processed_records = $1
+          WHERE id = $2
+        `, [names.length, jobId]);
       }
 
     } catch (err) {
-      db.prepare(`UPDATE screening_jobs SET status = 'failed' WHERE id = ?`).run(jobId);
+      await run(`UPDATE screening_jobs SET status = 'failed' WHERE id = $1`, [jobId]);
       console.error('[screen/batch] Job failed:', err.message);
     }
   });
@@ -120,47 +126,51 @@ router.post('/batch', express.json(), (req, res) => {
 
 // ── GET /api/screen/jobs/:id/media-results ────────────────────────────────────
 //   Returns adverse_media_results for a job. Mirrors /api/screening/jobs/:id/results
-router.get('/jobs/:id/media-results', (req, res) => {
-  const db = getDb();
-  const { page = 1, limit = 200, status } = req.query;
-  const offset = (parseInt(page) - 1) * parseInt(limit);
+router.get('/jobs/:id/media-results', async (req, res) => {
+  try {
+    const { page = 1, limit = 200, status } = req.query;
+    const offset   = (parseInt(page) - 1) * parseInt(limit);
+    const filtered = status && status !== 'all';
 
-  const where  = status && status !== 'all' ? 'AND status = ?' : '';
-  const params = status && status !== 'all'
-    ? [req.params.id, status, parseInt(limit), offset]
-    : [req.params.id, parseInt(limit), offset];
+    const rows = filtered
+      ? await all(`SELECT * FROM adverse_media_results WHERE job_id = $1 AND status = $2 ORDER BY row_number LIMIT $3 OFFSET $4`,
+          [req.params.id, status, parseInt(limit), offset])
+      : await all(`SELECT * FROM adverse_media_results WHERE job_id = $1 ORDER BY row_number LIMIT $2 OFFSET $3`,
+          [req.params.id, parseInt(limit), offset]);
 
-  const rows = db.prepare(
-    `SELECT * FROM adverse_media_results WHERE job_id = ? ${where} ORDER BY row_number LIMIT ? OFFSET ?`
-  ).all(...params);
+    const totalRow = filtered
+      ? await get(`SELECT COUNT(*)::int as n FROM adverse_media_results WHERE job_id = $1 AND status = $2`, [req.params.id, status])
+      : await get(`SELECT COUNT(*)::int as n FROM adverse_media_results WHERE job_id = $1`, [req.params.id]);
 
-  const totalRow = db.prepare(
-    `SELECT COUNT(*) as n FROM adverse_media_results WHERE job_id = ? ${where}`
-  ).get(...(status && status !== 'all' ? [req.params.id, status] : [req.params.id]));
-
-  res.json({
-    results: rows.map(r => ({ ...r, findings: JSON.parse(r.findings || '[]') })),
-    total:   totalRow.n,
-    page:    parseInt(page),
-    limit:   parseInt(limit),
-  });
+    res.json({
+      results: rows.map(r => ({ ...r, findings: JSON.parse(r.findings || '[]') })),
+      total:   totalRow.n,
+      page:    parseInt(page),
+      limit:   parseInt(limit),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── GET /api/screen/jobs/:id/media-summary ────────────────────────────────────
-router.get('/jobs/:id/media-summary', (req, res) => {
-  const db = getDb();
-  const byStatus = db.prepare(`
-    SELECT status, COUNT(*) as count FROM adverse_media_results WHERE job_id = ? GROUP BY status
-  `).all(req.params.id);
+router.get('/jobs/:id/media-summary', async (req, res) => {
+  try {
+    const byStatus = await all(`
+      SELECT status, COUNT(*)::int as count FROM adverse_media_results WHERE job_id = $1 GROUP BY status
+    `, [req.params.id]);
 
-  const byCategory = db.prepare(`
-    SELECT top_finding_category as category, COUNT(*) as count
-    FROM adverse_media_results
-    WHERE job_id = ? AND top_finding_category IS NOT NULL
-    GROUP BY top_finding_category ORDER BY count DESC
-  `).all(req.params.id);
+    const byCategory = await all(`
+      SELECT top_finding_category as category, COUNT(*)::int as count
+      FROM adverse_media_results
+      WHERE job_id = $1 AND top_finding_category IS NOT NULL
+      GROUP BY top_finding_category ORDER BY count DESC
+    `, [req.params.id]);
 
-  res.json({ byStatus, byCategory });
+    res.json({ byStatus, byCategory });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 module.exports = router;

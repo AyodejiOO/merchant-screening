@@ -3,8 +3,8 @@ const multer  = require('multer');
 const path    = require('path');
 const fs      = require('fs');
 const { parse } = require('csv-parse/sync');
-const { getDb }                   = require('../db/database');
-const { screenName, runBatchJob, buildIndex } = require('../services/screening');
+const { get, all, run }                        = require('../db/database');
+const { screenName, runBatchJob, buildIndex }  = require('../services/screening');
 
 const router      = express.Router();
 const UPLOADS_DIR = path.join(__dirname, '../../uploads');
@@ -95,7 +95,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
 
 // ── Step 2: Start batch screening on a previously uploaded file ─────────────
 // Accepts JSON body with { uploadId, jobName?, threshold?, nameColumn? }.
-router.post('/batch', express.json(), (req, res) => {
+router.post('/batch', express.json(), async (req, res) => {
   const { uploadId, nameColumn = null } = req.body || {};
   if (!uploadId) return res.status(400).json({ error: 'uploadId is required (run /upload first).' });
 
@@ -104,14 +104,20 @@ router.post('/batch', express.json(), (req, res) => {
     return res.status(404).json({ error: 'Uploaded file not found. Re-upload and try again.' });
   }
 
-  const db        = getDb();
   const threshold = req.body.threshold != null ? parseFloat(req.body.threshold) / 100 : 0.6;
   const jobName   = req.body.jobName || `Batch — ${new Date().toLocaleString()}`;
 
-  const { lastInsertRowid: jobId } = db.prepare(`
-    INSERT INTO screening_jobs (job_name, job_type, status, threshold, file_path)
-    VALUES (?, 'batch', 'pending', ?, ?)
-  `).run(jobName, threshold, filePath);
+  let jobId;
+  try {
+    const { rows } = await run(`
+      INSERT INTO screening_jobs (job_name, job_type, status, threshold, file_path)
+      VALUES ($1, 'batch', 'pending', $2, $3)
+      RETURNING id
+    `, [jobName, threshold, filePath]);
+    jobId = rows[0].id;
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 
   res.json({ jobId, status: 'pending', message: 'Batch screening started' });
 
@@ -124,7 +130,7 @@ router.post('/batch', express.json(), (req, res) => {
       });
 
       if (!records.length) {
-        db.prepare(`UPDATE screening_jobs SET status = 'failed' WHERE id = ?`).run(jobId);
+        await run(`UPDATE screening_jobs SET status = 'failed' WHERE id = $1`, [jobId]);
         return;
       }
 
@@ -135,81 +141,94 @@ router.post('/batch', express.json(), (req, res) => {
 
       await runBatchJob(jobId, names, threshold);
     } catch (err) {
-      db.prepare(`UPDATE screening_jobs SET status = 'failed' WHERE id = ?`).run(jobId);
+      await run(`UPDATE screening_jobs SET status = 'failed' WHERE id = $1`, [jobId]);
       console.error('[Batch] Job failed:', err.message);
     }
   });
 });
 
 // ── Jobs ─────────────────────────────────────────────────────────────────────
-router.get('/jobs', (req, res) => {
-  const db   = getDb();
-  const jobs = db.prepare(`SELECT * FROM screening_jobs ORDER BY created_at DESC LIMIT 100`).all();
-  res.json(jobs);
+router.get('/jobs', async (req, res) => {
+  try {
+    const jobs = await all(`SELECT * FROM screening_jobs ORDER BY created_at DESC LIMIT 100`);
+    res.json(jobs);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Lightweight endpoint for the global progress indicator.
 // Returns running jobs + jobs that completed/failed in the recent past.
-router.get('/jobs/active', (_req, res) => {
-  const db = getDb();
+router.get('/jobs/active', async (_req, res) => {
+  try {
+    const running = await all(`
+      SELECT id, job_name, status, total_records, processed_records, match_count, created_at
+      FROM screening_jobs
+      WHERE status = 'running'
+      ORDER BY created_at DESC
+    `);
 
-  const running = db.prepare(`
-    SELECT id, job_name, status, total_records, processed_records, match_count, created_at
-    FROM screening_jobs
-    WHERE status = 'running'
-    ORDER BY created_at DESC
-  `).all();
+    // Show "completed" state briefly (5s) so the analyst notices the transition.
+    // Show "failed" state longer (60s) — failures need more attention.
+    const recentlyCompleted = await all(`
+      SELECT id, job_name, status, total_records, processed_records, match_count, completed_at
+      FROM screening_jobs
+      WHERE (status = 'completed' AND completed_at > now() - interval '5 seconds')
+         OR (status = 'failed'    AND completed_at > now() - interval '60 seconds')
+      ORDER BY completed_at DESC
+    `);
 
-  // Show "completed" state briefly (5s) so the analyst notices the transition.
-  // Show "failed" state longer (60s) — failures need more attention.
-  const recentlyCompleted = db.prepare(`
-    SELECT id, job_name, status, total_records, processed_records, match_count, completed_at
-    FROM screening_jobs
-    WHERE (status = 'completed' AND completed_at > datetime('now', '-5 seconds'))
-       OR (status = 'failed'    AND completed_at > datetime('now', '-60 seconds'))
-    ORDER BY completed_at DESC
-  `).all();
-
-  res.json({ running, recentlyCompleted });
+    res.json({ running, recentlyCompleted });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-router.get('/jobs/:id', (req, res) => {
-  const db  = getDb();
-  const job = db.prepare(`SELECT * FROM screening_jobs WHERE id = ?`).get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'Job not found' });
-  res.json(job);
+router.get('/jobs/:id', async (req, res) => {
+  try {
+    const job = await get(`SELECT * FROM screening_jobs WHERE id = $1`, [req.params.id]);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    res.json(job);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-router.get('/jobs/:id/results', (req, res) => {
-  const db              = getDb();
-  const { page = 1, limit = 200, status } = req.query;
-  const offset          = (parseInt(page) - 1) * parseInt(limit);
+router.get('/jobs/:id/results', async (req, res) => {
+  try {
+    const { page = 1, limit = 200, status } = req.query;
+    const offset    = (parseInt(page) - 1) * parseInt(limit);
+    const filtered  = status && status !== 'all';
 
-  const where  = status && status !== 'all' ? 'AND status = ?' : '';
-  const params = status && status !== 'all'
-    ? [req.params.id, status, parseInt(limit), offset]
-    : [req.params.id, parseInt(limit), offset];
+    const rows = filtered
+      ? await all(`SELECT * FROM screening_results WHERE job_id = $1 AND status = $2 ORDER BY row_number LIMIT $3 OFFSET $4`,
+          [req.params.id, status, parseInt(limit), offset])
+      : await all(`SELECT * FROM screening_results WHERE job_id = $1 ORDER BY row_number LIMIT $2 OFFSET $3`,
+          [req.params.id, parseInt(limit), offset]);
 
-  const rows = db.prepare(
-    `SELECT * FROM screening_results WHERE job_id = ? ${where} ORDER BY row_number LIMIT ? OFFSET ?`
-  ).all(...params);
+    const totalRow = filtered
+      ? await get(`SELECT COUNT(*)::int as n FROM screening_results WHERE job_id = $1 AND status = $2`, [req.params.id, status])
+      : await get(`SELECT COUNT(*)::int as n FROM screening_results WHERE job_id = $1`, [req.params.id]);
 
-  const totalRow = db.prepare(
-    `SELECT COUNT(*) as n FROM screening_results WHERE job_id = ? ${where}`
-  ).get(...(status && status !== 'all' ? [req.params.id, status] : [req.params.id]));
-
-  res.json({
-    results: rows.map(r => ({ ...r, matches: JSON.parse(r.matches || '[]') })),
-    total:   totalRow.n,
-    page:    parseInt(page),
-    limit:   parseInt(limit),
-  });
+    res.json({
+      results: rows.map(r => ({ ...r, matches: JSON.parse(r.matches || '[]') })),
+      total:   totalRow.n,
+      page:    parseInt(page),
+      limit:   parseInt(limit),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Rebuild index ─────────────────────────────────────────────────────────────
-router.post('/rebuild-index', (_, res) => {
-  const count = buildIndex();
-  res.json({ message: 'Index rebuilt', itemCount: count });
+router.post('/rebuild-index', async (_, res) => {
+  try {
+    const count = await buildIndex();
+    res.json({ message: 'Index rebuilt', itemCount: count });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 module.exports = router;

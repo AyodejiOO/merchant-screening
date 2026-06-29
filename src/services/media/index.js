@@ -11,12 +11,7 @@
 
 const fetchers     = require('./fetchers/registry');
 const classifiers  = require('./classifiers/registry');
-const { getDb }    = require('../../db/database');
-
-function getSetting(key, fallback) {
-  const row = getDb().prepare(`SELECT value FROM settings WHERE key = ?`).get(key);
-  return row?.value ?? fallback;
-}
+const { getSetting } = require('../../db/database');
 
 // Map an aggregate top-score to a status bucket. Mirrors the sanctions taxonomy.
 function statusFromScore(score) {
