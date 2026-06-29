@@ -32,3 +32,6 @@ npm-debug.log*
 
 # Local agent / tool config (not shared)
 .claude/
+
+# Security docs — audit reports, threat models, exploit notes (never commit)
+docs/security/
