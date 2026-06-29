@@ -9,7 +9,9 @@
 
 A compliance screening tool for fintech and payments teams. Screens merchants against six global sanction lists and adverse media sources, with fuzzy matching, single name lookup, and bulk CSV batch processing.
 
-![Sanction Screening dashboard — list status across OFAC, EU, UN, UK, Australia and Canada, plus adverse media sources](docs/screenshot.png)
+![Sanction screening demo — dashboard, a confirmed OFAC match, and a clear result](docs/demo.gif)
+
+▶ [Watch the full-quality MP4](docs/demo.mp4) · 🖼 [Static dashboard screenshot](docs/screenshot.png)
 
 ## What it does
 
