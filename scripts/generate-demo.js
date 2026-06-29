@@ -33,6 +33,17 @@ async function snap(page) {
 async function hold(page, n) { for (let i = 0; i < n; i++) await snap(page); }
 const waitFor = (page, fn, timeout = 12000) => page.waitForFunction(fn, { timeout }).catch(() => {});
 
+// Capture frames while polling a readiness predicate (so live loading states,
+// e.g. the adverse-media spinner, are recorded rather than skipped).
+async function captureUntil(page, readyFn, maxFrames = 70, delayMs = 120) {
+  for (let i = 0; i < maxFrames; i++) {
+    await snap(page);
+    if (await page.evaluate(readyFn)) return true;
+    await sleep(delayMs);
+  }
+  return false;
+}
+
 async function setCaption(page, text) {
   await page.evaluate((t) => { const c = document.getElementById('__cap'); if (c) c.textContent = t; }, text);
 }
@@ -99,25 +110,35 @@ async function capture() {
   await setCaption(page, 'Dashboard · 46,927 entries across 6 global sanctions lists');
   await hold(page, 26);
 
-  // ── 2. Screen: single name → confirmed match ────────────────────────────
+  // ── 2. Screen: single name → sanctions + adverse media ──────────────────
   await gotoTab('lookup');
-  await setCaption(page, 'Screen · check a single name against every sanctions list');
-  await hold(page, 10);
-  cur = await moveCursor(page, cur, await centerOf(page, '#tab-lookup button.check-toggle-btn[data-check="media"]'), 10);
-  await page.click('#tab-lookup button.check-toggle-btn[data-check="media"]'); // sanctions-only
-  await hold(page, 5);
+  await setCaption(page, 'Screen · one name, checked against sanctions + adverse media');
+  await hold(page, 12);
+  // (leave BOTH checks on — sanctions AND adverse media)
   cur = await moveCursor(page, cur, await centerOf(page, '#lookup-name'), 10);
   await page.click('#lookup-name');
   await hold(page, 3);
-  for (const ch of 'Vladimir Putin') { await page.type('#lookup-name', ch); await snap(page); await snap(page); }
+  for (const ch of 'Bashar al-Assad') { await page.type('#lookup-name', ch); await snap(page); await snap(page); }
   await hold(page, 3);
   cur = await moveCursor(page, cur, await centerOf(page, '#tab-lookup .btn-primary.btn-full'), 10);
   await page.click('#tab-lookup .btn-primary.btn-full');
-  for (let i = 0; i < 6; i++) { await snap(page); await sleep(70); }
-  await waitFor(page, () => { const el = document.querySelector('#lookup-results'); return el && el.querySelector('.result-status-bar'); });
+  await setCaption(page, 'Screen · fetching live news — adverse media may take a moment…');
+  await captureUntil(page, () => { const el = document.querySelector('#lookup-results'); return el && el.querySelector('.result-status-bar'); }, 80, 120);
   await sleep(300);
-  await setCaption(page, 'Screen · fuzzy match — confirmed against the OFAC list');
-  await hold(page, 30);
+  // sanctions section first
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await setCaption(page, 'Sanctions · fuzzy match — confirmed against the OFAC list');
+  await hold(page, 26);
+  // reveal the adverse-media section
+  await setCaption(page, 'Adverse Media · live news scanned for fraud, corruption & sanctions');
+  await page.evaluate(() => {
+    const secs = document.querySelectorAll('#lookup-results .results-section');
+    const last = secs[secs.length - 1];
+    if (last) last.scrollIntoView({ behavior: 'instant', block: 'center' });
+  });
+  await hold(page, 32);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await hold(page, 4);
 
   // ── 3. Batch Screening: upload CSV + run ─────────────────────────────────
   await gotoTab('batch');
