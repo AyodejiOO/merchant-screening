@@ -1,16 +1,14 @@
 // Regenerates the README demo (docs/demo.gif + docs/demo.mp4) by driving the
-// real running app through the screening flow in a headless browser.
+// real running app through a full product tour in a headless browser:
+//   Dashboard → Screen (single, confirmed match) → Batch Screening (CSV upload
+//   + run) → Jobs & Reports (results + distribution) → Settings.
 //
 // Prerequisites:
 //   - The app is running locally:  npm start   (http://localhost:3000)
-//   - Google Chrome is installed
-//   - ffmpeg is installed and on PATH
+//   - Google Chrome is installed; ffmpeg is on PATH
 //   - devDependency `puppeteer-core` is installed
 //
 // Usage:   node scripts/generate-demo.js
-//
-// It captures numbered PNG frames to a temp dir, then ffmpeg stitches them into
-// a 15fps MP4 (1280-wide) and an autoplay-friendly GIF (1000-wide).
 
 const puppeteer = require('puppeteer-core');
 const { execFileSync } = require('child_process');
@@ -22,6 +20,7 @@ const URL = process.env.DEMO_URL || 'http://localhost:3000';
 const CHROME = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const ROOT = path.join(__dirname, '..');
 const DOCS = path.join(ROOT, 'docs');
+const CSV = path.join(__dirname, 'demo-merchants.csv');
 const FRAMES_DIR = process.env.FRAMES_DIR || path.join(os.tmpdir(), 'mss-demo-frames');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -31,6 +30,7 @@ async function snap(page) {
   await page.screenshot({ path: path.join(FRAMES_DIR, `frame-${String(frameNo).padStart(4, '0')}.png`) });
 }
 async function hold(page, n) { for (let i = 0; i < n; i++) await snap(page); }
+const waitFor = (page, fn, timeout = 12000) => page.waitForFunction(fn, { timeout }).catch(() => {});
 
 async function centerOf(page, selector) {
   return page.evaluate((sel) => {
@@ -79,55 +79,78 @@ async function capture() {
   }, CURSOR_CSS);
   let cur = { x: 640, y: 300 };
 
-  const T_SCREEN = 'button.tab[data-tab="lookup"]';
-  const T_MEDIA  = '#tab-lookup button.check-toggle-btn[data-check="media"]';
-  const T_INPUT  = '#lookup-name';
-  const T_RUN    = '#tab-lookup .btn-primary.btn-full';
+  const tab = t => `button.tab[data-tab="${t}"]`;
+  async function gotoTab(t, settle = 400) {
+    cur = await moveCursor(page, cur, await centerOf(page, tab(t)), 12);
+    await page.click(tab(t));
+    await sleep(settle);
+  }
 
-  await hold(page, 24);                                                   // dashboard
+  // ── 1. Dashboard ────────────────────────────────────────────────────────
+  await hold(page, 22);
 
-  cur = await moveCursor(page, cur, await centerOf(page, T_SCREEN), 14);  // → Screen tab
-  await hold(page, 2);
-  await page.click(T_SCREEN);
-  await sleep(350);
-  await hold(page, 10);
-
-  cur = await moveCursor(page, cur, await centerOf(page, T_MEDIA), 10);   // sanctions-only
-  await page.click(T_MEDIA);
-  await hold(page, 6);
-
-  cur = await moveCursor(page, cur, await centerOf(page, T_INPUT), 10);   // type a sanctioned name
-  await page.click(T_INPUT);
-  await hold(page, 4);
-  for (const ch of 'Vladimir Putin') { await page.type(T_INPUT, ch); await snap(page); await snap(page); }
-  await hold(page, 4);
-
-  cur = await moveCursor(page, cur, await centerOf(page, T_RUN), 10);     // run → confirmed match
-  await hold(page, 2);
-  await page.click(T_RUN);
-  for (let i = 0; i < 6; i++) { await snap(page); await sleep(70); }
-  await page.waitForFunction(
-    () => { const el = document.querySelector('#lookup-results'); return el && el.querySelector('.result-status-bar'); },
-    { timeout: 15000 }
-  ).catch(() => {});
-  await sleep(300);
-  await hold(page, 34);
-
-  cur = await moveCursor(page, cur, await centerOf(page, T_INPUT), 8);    // clean name → clear
-  await page.click(T_INPUT, { clickCount: 3 });
-  await page.keyboard.press('Backspace');
-  await snap(page);
-  for (const ch of 'Jane Smith Bakery LLC') { await page.type(T_INPUT, ch); await snap(page); }
+  // ── 2. Screen: single name → confirmed match ────────────────────────────
+  await gotoTab('lookup');
+  await hold(page, 8);
+  cur = await moveCursor(page, cur, await centerOf(page, '#tab-lookup button.check-toggle-btn[data-check="media"]'), 10);
+  await page.click('#tab-lookup button.check-toggle-btn[data-check="media"]'); // sanctions-only
+  await hold(page, 5);
+  cur = await moveCursor(page, cur, await centerOf(page, '#lookup-name'), 10);
+  await page.click('#lookup-name');
   await hold(page, 3);
-  cur = await moveCursor(page, cur, await centerOf(page, T_RUN), 8);
-  await page.click(T_RUN);
-  for (let i = 0; i < 5; i++) { await snap(page); await sleep(70); }
-  await page.waitForFunction(
-    () => { const el = document.querySelector('#lookup-results'); return el && el.querySelector('.result-status-bar'); },
-    { timeout: 15000 }
-  ).catch(() => {});
+  for (const ch of 'Vladimir Putin') { await page.type('#lookup-name', ch); await snap(page); await snap(page); }
+  await hold(page, 3);
+  cur = await moveCursor(page, cur, await centerOf(page, '#tab-lookup .btn-primary.btn-full'), 10);
+  await page.click('#tab-lookup .btn-primary.btn-full');
+  for (let i = 0; i < 6; i++) { await snap(page); await sleep(70); }
+  await waitFor(page, () => { const el = document.querySelector('#lookup-results'); return el && el.querySelector('.result-status-bar'); });
   await sleep(300);
-  await hold(page, 30);
+  await hold(page, 28);
+
+  // ── 3. Batch Screening: upload CSV + run ─────────────────────────────────
+  await gotoTab('batch');
+  await hold(page, 8);
+  cur = await moveCursor(page, cur, await centerOf(page, '#tab-batch button.check-toggle-btn[data-check="media"]'), 10);
+  await page.click('#tab-batch button.check-toggle-btn[data-check="media"]'); // sanctions-only
+  await hold(page, 4);
+  cur = await moveCursor(page, cur, await centerOf(page, '#batch-job-name'), 8);
+  await page.click('#batch-job-name');
+  for (const ch of 'Merchant Review - Q2 2026') { await page.type('#batch-job-name', ch); await snap(page); }
+  await hold(page, 3);
+  // attach the CSV to the (hidden) file input
+  const fileInput = await page.$('#file-input');
+  await fileInput.uploadFile(CSV);
+  await waitFor(page, () => !document.getElementById('file-chip').classList.contains('hidden'), 5000);
+  await hold(page, 8);
+  // click submit → uploads the file
+  cur = await moveCursor(page, cur, await centerOf(page, '#batch-submit-btn'), 10);
+  await page.click('#batch-submit-btn');
+  await waitFor(page, () => { const l = document.querySelector('#batch-submit-btn .batch-submit-label'); return l && /start/i.test(l.textContent); }, 15000);
+  await hold(page, 6);
+  // click submit again → starts the batch job
+  await page.click('#batch-submit-btn');
+  await sleep(500);
+  await hold(page, 8);
+  await sleep(2500); // let the 10-row batch finish server-side
+
+  // ── 4. Jobs & Reports: open the job → distribution + results ─────────────
+  await gotoTab('jobs');
+  await waitFor(page, () => document.querySelector('#jobs-list .job-row'), 8000);
+  await hold(page, 6);
+  cur = await moveCursor(page, cur, await centerOf(page, '#jobs-list .job-row'), 10);
+  await page.click('#jobs-list .job-row');
+  await waitFor(page, () => { const p = document.getElementById('results-panel'); return p && !p.classList.contains('hidden') && document.querySelector('.distribution-bar'); }, 10000);
+  await sleep(400);
+  await hold(page, 32);
+
+  // ── 5. Settings ──────────────────────────────────────────────────────────
+  await gotoTab('settings');
+  await sleep(300);
+  await hold(page, 16);
+  await page.evaluate(() => window.scrollBy({ top: 380, left: 0, behavior: 'instant' }));
+  await hold(page, 14);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await hold(page, 8);
 
   await browser.close();
   return frameNo;
@@ -137,11 +160,9 @@ function encode() {
   const pattern = path.join(FRAMES_DIR, 'frame-%04d.png');
   const palette = path.join(FRAMES_DIR, 'palette.png');
   fs.mkdirSync(DOCS, { recursive: true });
-  // MP4
   execFileSync('ffmpeg', ['-y', '-framerate', '15', '-i', pattern,
     '-vf', 'scale=1280:-2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
     '-movflags', '+faststart', path.join(DOCS, 'demo.mp4')], { stdio: 'ignore' });
-  // GIF (two-pass palette)
   execFileSync('ffmpeg', ['-y', '-framerate', '15', '-i', pattern,
     '-vf', 'scale=1000:-1:flags=lanczos,palettegen=stats_mode=diff', palette], { stdio: 'ignore' });
   execFileSync('ffmpeg', ['-y', '-framerate', '15', '-i', pattern, '-i', palette,
