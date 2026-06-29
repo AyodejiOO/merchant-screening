@@ -1,5 +1,6 @@
 // Regenerates the README demo (docs/demo.gif + docs/demo.mp4) by driving the
-// real running app through a full product tour in a headless browser:
+// real running app through a full product tour in a headless browser, with a
+// caption overlay describing each page:
 //   Dashboard → Screen (single, confirmed match) → Batch Screening (CSV upload
 //   + run) → Jobs & Reports (results + distribution) → Settings.
 //
@@ -32,6 +33,9 @@ async function snap(page) {
 async function hold(page, n) { for (let i = 0; i < n; i++) await snap(page); }
 const waitFor = (page, fn, timeout = 12000) => page.waitForFunction(fn, { timeout }).catch(() => {});
 
+async function setCaption(page, text) {
+  await page.evaluate((t) => { const c = document.getElementById('__cap'); if (c) c.textContent = t; }, text);
+}
 async function centerOf(page, selector) {
   return page.evaluate((sel) => {
     const el = document.querySelector(sel);
@@ -56,6 +60,12 @@ const CURSOR_CSS =
   "filter:drop-shadow(0 1px 2px rgba(0,0,0,.6));background-repeat:no-repeat;background-position:center;background-size:contain;" +
   "background-image:url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='white' stroke='%230C0E14' stroke-width='1.5'><path d='M5 3l14 7-6 2-2 6z'/></svg>\");";
 
+const CAPTION_CSS =
+  "position:fixed;left:50%;bottom:26px;transform:translateX(-50%);max-width:78%;padding:11px 22px;" +
+  "background:rgba(12,14,20,.92);border:1px solid #2E3547;border-left:3px solid #006CFF;border-radius:9px;" +
+  "color:#EEF0F7;font-family:Inter,-apple-system,sans-serif;font-size:16px;font-weight:600;letter-spacing:-0.01em;" +
+  "text-align:center;z-index:2147483646;pointer-events:none;box-shadow:0 8px 32px rgba(0,0,0,.5);";
+
 async function capture() {
   fs.rmSync(FRAMES_DIR, { recursive: true, force: true });
   fs.mkdirSync(FRAMES_DIR, { recursive: true });
@@ -71,12 +81,11 @@ async function capture() {
   await page.goto(URL, { waitUntil: 'networkidle2' });
   await sleep(1000);
 
-  await page.evaluate((css) => {
-    const c = document.createElement('div');
-    c.id = '__cur';
-    c.setAttribute('style', css);
-    document.body.appendChild(c);
-  }, CURSOR_CSS);
+  // Inject the fake cursor + caption overlay
+  await page.evaluate((cur, cap) => {
+    const c = document.createElement('div'); c.id = '__cur'; c.setAttribute('style', cur); document.body.appendChild(c);
+    const k = document.createElement('div'); k.id = '__cap'; k.setAttribute('style', cap); document.body.appendChild(k);
+  }, CURSOR_CSS, CAPTION_CSS);
   let cur = { x: 640, y: 300 };
 
   const tab = t => `button.tab[data-tab="${t}"]`;
@@ -87,11 +96,13 @@ async function capture() {
   }
 
   // ── 1. Dashboard ────────────────────────────────────────────────────────
-  await hold(page, 22);
+  await setCaption(page, 'Dashboard · 46,927 entries across 6 global sanctions lists');
+  await hold(page, 26);
 
   // ── 2. Screen: single name → confirmed match ────────────────────────────
   await gotoTab('lookup');
-  await hold(page, 8);
+  await setCaption(page, 'Screen · check a single name against every sanctions list');
+  await hold(page, 10);
   cur = await moveCursor(page, cur, await centerOf(page, '#tab-lookup button.check-toggle-btn[data-check="media"]'), 10);
   await page.click('#tab-lookup button.check-toggle-btn[data-check="media"]'); // sanctions-only
   await hold(page, 5);
@@ -105,11 +116,13 @@ async function capture() {
   for (let i = 0; i < 6; i++) { await snap(page); await sleep(70); }
   await waitFor(page, () => { const el = document.querySelector('#lookup-results'); return el && el.querySelector('.result-status-bar'); });
   await sleep(300);
-  await hold(page, 28);
+  await setCaption(page, 'Screen · fuzzy match — confirmed against the OFAC list');
+  await hold(page, 30);
 
   // ── 3. Batch Screening: upload CSV + run ─────────────────────────────────
   await gotoTab('batch');
-  await hold(page, 8);
+  await setCaption(page, 'Batch Screening · upload a CSV of merchants to screen at once');
+  await hold(page, 10);
   cur = await moveCursor(page, cur, await centerOf(page, '#tab-batch button.check-toggle-btn[data-check="media"]'), 10);
   await page.click('#tab-batch button.check-toggle-btn[data-check="media"]'); // sanctions-only
   await hold(page, 4);
@@ -117,38 +130,38 @@ async function capture() {
   await page.click('#batch-job-name');
   for (const ch of 'Merchant Review - Q2 2026') { await page.type('#batch-job-name', ch); await snap(page); }
   await hold(page, 3);
-  // attach the CSV to the (hidden) file input
   const fileInput = await page.$('#file-input');
   await fileInput.uploadFile(CSV);
   await waitFor(page, () => !document.getElementById('file-chip').classList.contains('hidden'), 5000);
   await hold(page, 8);
-  // click submit → uploads the file
   cur = await moveCursor(page, cur, await centerOf(page, '#batch-submit-btn'), 10);
-  await page.click('#batch-submit-btn');
+  await page.click('#batch-submit-btn'); // uploads
   await waitFor(page, () => { const l = document.querySelector('#batch-submit-btn .batch-submit-label'); return l && /start/i.test(l.textContent); }, 15000);
-  await hold(page, 6);
-  // click submit again → starts the batch job
-  await page.click('#batch-submit-btn');
+  await setCaption(page, 'Batch Screening · run sanctions checks on every row');
+  await hold(page, 8);
+  await page.click('#batch-submit-btn'); // starts the job
   await sleep(500);
   await hold(page, 8);
   await sleep(2500); // let the 10-row batch finish server-side
 
   // ── 4. Jobs & Reports: open the job → distribution + results ─────────────
   await gotoTab('jobs');
+  await setCaption(page, 'Jobs & Reports · status breakdown, full results & CSV export');
   await waitFor(page, () => document.querySelector('#jobs-list .job-row'), 8000);
-  await hold(page, 6);
+  await hold(page, 8);
   cur = await moveCursor(page, cur, await centerOf(page, '#jobs-list .job-row'), 10);
   await page.click('#jobs-list .job-row');
   await waitFor(page, () => { const p = document.getElementById('results-panel'); return p && !p.classList.contains('hidden') && document.querySelector('.distribution-bar'); }, 10000);
   await sleep(400);
-  await hold(page, 32);
+  await hold(page, 34);
 
   // ── 5. Settings ──────────────────────────────────────────────────────────
   await gotoTab('settings');
+  await setCaption(page, 'Settings · tune thresholds, schedules & sanction-list sources');
   await sleep(300);
-  await hold(page, 16);
+  await hold(page, 18);
   await page.evaluate(() => window.scrollBy({ top: 380, left: 0, behavior: 'instant' }));
-  await hold(page, 14);
+  await hold(page, 16);
   await page.evaluate(() => window.scrollTo(0, 0));
   await hold(page, 8);
 
