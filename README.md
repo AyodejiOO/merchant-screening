@@ -3,9 +3,9 @@
 > Screen any merchant against six global sanctions lists and adverse media in one request — fuzzy matching, single-name lookup, and bulk CSV batch jobs with a full audit trail.
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Node](https://img.shields.io/badge/Node-22%20LTS-339933?logo=node.js&logoColor=white)
+![Node](https://img.shields.io/badge/Node-18%2B-339933?logo=node.js&logoColor=white)
 ![Express](https://img.shields.io/badge/Express-4-000000?logo=express&logoColor=white)
-![SQLite](https://img.shields.io/badge/SQLite-better--sqlite3-003B57?logo=sqlite&logoColor=white)
+![Postgres](https://img.shields.io/badge/Postgres-Supabase-3ECF8E?logo=supabase&logoColor=white)
 
 A compliance screening tool for fintech and payments teams. Screens merchants against six global sanction lists and adverse media sources, with fuzzy matching, single name lookup, and bulk CSV batch processing.
 
@@ -20,7 +20,7 @@ A compliance screening tool for fintech and payments teams. Screens merchants ag
 - **Adverse media** — searches Google News and GDELT for fraud, corruption, sanctions violations, and other compliance-relevant news about a merchant
 - **Confidence visualization** — distribution bar showing the spread of statuses (confirmed / potential / review / clear) for each batch
 - **Scheduled list sync** — refreshes all six sanction lists weekly (default: Sundays 2am)
-- **Audit trail** — every job and result is persisted in SQLite for compliance review
+- **Audit trail** — every job and result is persisted in Postgres for compliance review
 - **CSV export** — full match details for any job
 
 ## ⚠️ Adverse media: LLM classifier setup (optional but recommended)
@@ -42,8 +42,8 @@ By default, adverse media articles are classified using a **keyword classifier**
 
 ## Tech stack
 
-- **Backend**: Node.js (22 LTS) + Express
-- **Storage**: SQLite (via `better-sqlite3`) — no external DB needed
+- **Backend**: Node.js (18+) + Express
+- **Storage**: Postgres (Supabase) via `pg` — connection string in `DATABASE_URL`
 - **Matching**: Fuse.js for fuzzy name matching with custom normalization
 - **Scheduling**: node-cron
 - **Frontend**: Vanilla JS + plain CSS (no framework), Inter typography
@@ -51,16 +51,19 @@ By default, adverse media articles are classified using a **keyword classifier**
 
 ## Local setup
 
-Requires **Node 22 LTS** (Node 25+ has incompatibilities with `better-sqlite3`'s native build).
+Requires **Node 18+** and a free **[Supabase](https://supabase.com)** Postgres database.
+
+1. Create a Supabase project and copy its **Session pooler** connection string (Project Settings → Database).
+2. Copy `.env.example` to `.env` and set `DATABASE_URL` to that connection string.
+3. Install dependencies, create the tables, then start:
 
 ```bash
-nvm install 22         # if not already on 22
-nvm use 22
 npm install
+npm run db:init     # applies db/schema.sql to your Supabase database
 npm start
 ```
 
-The app boots on `http://localhost:3000`. On first run, the SQLite database is created at `data/sanctions.db` with default settings. Navigate to the Dashboard tab and click **Sync all lists** to download and parse all six sanction sources (~2–3 minutes).
+The app boots on `http://localhost:3000`. On first run the database is empty — open the Dashboard and click **Sync all lists** to download and parse all six sanction sources into Supabase (~2–3 minutes).
 
 ## Key files
 
