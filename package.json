@@ -6,7 +6,8 @@
   "license": "MIT",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "nodemon src/server.js"
+    "dev": "nodemon src/server.js",
+    "db:init": "node db/init.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.100.1",
@@ -19,6 +20,7 @@
     "fuse.js": "^7.0.0",
     "multer": "^1.4.5-lts.1",
     "node-cron": "^3.0.3",
+    "pg": "^8.22.0",
     "xlsx": "^0.18.5",
     "xml2js": "^0.6.2"
   },
